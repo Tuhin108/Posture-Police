@@ -4,7 +4,13 @@ import mediapipe as mp
 import numpy as np
 import time
 import threading
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
+import av
+
+from streamlit_webrtc import (
+    webrtc_streamer,
+    VideoProcessorBase,
+    WebRtcMode
+)
 
 # =========================
 # CONFIG
@@ -37,8 +43,10 @@ mp_pose = mp.solutions.pose
 
 @st.cache_resource
 def load_pose():
-    return mp_pose.Pose(min_detection_confidence=0.5,
-                        min_tracking_confidence=0.5)
+    return mp_pose.Pose(
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5
+    )
 
 pose = load_pose()
 
@@ -122,9 +130,11 @@ def draw_hud(frame, is_bad, coords, debug):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
     if is_bad:
-        cv2.rectangle(frame, (0,0), (w,h), (0,0,255), 8)
-        cv2.putText(frame, "FIX POSTURE!", (w//2-140, h//2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0,0,255), 3)
+        cv2.rectangle(frame, (0, 0), (w, h), (0, 0, 255), 8)
+        cv2.putText(frame, "FIX POSTURE!",
+                    (w//2 - 140, h//2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.1,
+                    (0, 0, 255), 3)
 
     return frame
 
@@ -152,21 +162,16 @@ class PostureProcessor(VideoProcessorBase):
                 st.session_state.calibrate_request = False
 
             if st.session_state.calibrated:
-                is_bad, coords, debug = check_posture(lm, img.shape, sensitivity)
+                is_bad, coords, debug = check_posture(
+                    lm, img.shape, sensitivity
+                )
                 img = draw_hud(img, is_bad, coords, debug)
-
-                if is_bad:
-                    if st.session_state.bad_posture_start is None:
-                        st.session_state.bad_posture_start = time.time()
-                else:
-                    st.session_state.bad_posture_start = None
-                    alarm_event.clear()
             else:
                 cv2.putText(img, "Sit straight & Click Calibrate",
                             (30, 60), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.8, (0,255,0), 2)
+                            0.8, (0, 255, 0), 2)
 
-        return img
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 # =========================
 # UI
@@ -186,10 +191,16 @@ st.title("👮 Posture Police")
 
 ctx = webrtc_streamer(
     key="posture-police",
+    mode=WebRtcMode.SENDRECV,
     video_processor_factory=PostureProcessor,
     media_stream_constraints={"video": True, "audio": False},
+    rtc_configuration={
+        "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+    },
     async_processing=True,
 )
 
-if not ctx.state.playing:
-    st.info("📹 Click 'Start' above to enable camera")
+if ctx.state.playing:
+    st.success("✅ Camera stream running")
+else:
+    st.info("📹 Click Start above and allow camera access")
