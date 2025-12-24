@@ -1,212 +1,277 @@
 import streamlit as st
 import cv2
 import mediapipe as mp
-import numpy as np
 import time
 import threading
-import winsound
+import platform
 
-# Fix for Pylance/VS Code errors
+# =========================
+# CONFIG
+# =========================
+st.set_page_config(page_title="Posture Police", layout="wide")
+
+try:
+    import winsound  # Windows only
+except Exception:
+    winsound = None
+
+alarm_event = threading.Event()
+alarm_lock = threading.Lock()
+
+# =========================
+# SESSION STATE INIT
+# =========================
+def init_state():
+    defaults = {
+        "initialized": True,
+        "calibrated": False,
+        "baseline_neck": 0.0,
+        "baseline_eye_level": 0.0,
+        "bad_posture_start": None,
+        "camera_on": False,
+        "calibrate_request": False,
+        "cap": None,
+        "stop_requested": False,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+init_state()
+
+# =========================
+# CAMERA CONTROL
+# =========================
+def get_camera():
+    if st.session_state.cap is None:
+        try:
+            if platform.system() == "Windows":
+                st.session_state.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            else:
+                st.session_state.cap = cv2.VideoCapture(0)
+        except Exception:
+            st.session_state.cap = cv2.VideoCapture(0)
+    return st.session_state.cap
+
+
+def release_camera():
+    cap = st.session_state.get("cap")
+    if cap is not None:
+        try:
+            cap.release()
+        except Exception:
+            pass
+    st.session_state.cap = None
+
+
+# Always release on reload if camera flag is off
+if st.session_state.cap is not None and not st.session_state.camera_on:
+    release_camera()
+
+# =========================
+# CALLBACKS
+# =========================
+def stop_camera():
+    release_camera()
+    alarm_event.clear()
+
+if st.session_state.stop_requested:
+    st.session_state.camera_on = False
+    st.session_state.stop_requested = False
+    stop_camera()
+
+
+
+# =========================
+# MEDIAPIPE
+# =========================
 mp_pose = mp.solutions.pose  # type: ignore
 
-# Global event for alarm control
-alarm_event = threading.Event()
+@st.cache_resource
+def load_pose():
+    return mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
-def initialize_session_state():
-    if 'calibrated' not in st.session_state:
-        st.session_state.calibrated = False
-    if 'baseline_neck' not in st.session_state:
-        st.session_state.baseline_neck = 0
-    if 'baseline_eye_level' not in st.session_state:
-        st.session_state.baseline_eye_level = 0
-    if 'bad_posture_start' not in st.session_state:
-        st.session_state.bad_posture_start = None
-    if 'camera_on' not in st.session_state:
-        st.session_state.camera_on = False
+# =========================
+# POSTURE LOGIC
+# =========================
+def calibrate(landmarks, shape):
+    h, _ = shape[:2]
+    le, re = landmarks[7], landmarks[8]
+    ls, rs = landmarks[11], landmarks[12]
+    ley, rey = landmarks[2], landmarks[5]
 
-def calibrate(landmarks, frame_shape):
-    h, w = frame_shape[:2]
-    
-    # Get Coordinates
-    left_ear = landmarks[7]
-    right_ear = landmarks[8]
-    left_shoulder = landmarks[11]
-    right_shoulder = landmarks[12]
-    left_eye = landmarks[2]
-    right_eye = landmarks[5]
-    
-    # Averages
-    avg_ear_y = (left_ear.y + right_ear.y) / 2 * h
-    avg_shoulder_y = (left_shoulder.y + right_shoulder.y) / 2 * h
-    avg_eye_y = (left_eye.y + right_eye.y) / 2 * h
-    
-    # Metric 1: Neck Length (Vertical distance Ear to Shoulder)
-    baseline_neck = avg_shoulder_y - avg_ear_y
-    
-    # Metric 2: Eye Level (Absolute Y position on screen)
-    baseline_eye_level = avg_eye_y
-    
-    return baseline_neck, baseline_eye_level
+    ear_y = (le.y + re.y) / 2 * h
+    sh_y = (ls.y + rs.y) / 2 * h
+    eye_y = (ley.y + rey.y) / 2 * h
 
-def check_posture(landmarks, frame_shape, sensitivity):
-    h, w = frame_shape[:2]
-    
-    left_ear = landmarks[7]
-    right_ear = landmarks[8]
-    left_shoulder = landmarks[11]
-    right_shoulder = landmarks[12]
-    left_eye = landmarks[2]
-    right_eye = landmarks[5]
-    
-    # Current Metrics
-    avg_ear_y = (left_ear.y + right_ear.y) / 2 * h
-    avg_shoulder_y = (left_shoulder.y + right_shoulder.y) / 2 * h
-    avg_eye_y = (left_eye.y + right_eye.y) / 2 * h
-    
-    curr_neck = avg_shoulder_y - avg_ear_y
-    curr_eye_level = avg_eye_y
-    
-    # --- LOGIC WITH SENSITIVITY ---
-    # Sensitivity 1 (Loose) -> Requires 30% drop to trigger
-    # Sensitivity 5 (Medium) -> Requires 15% drop to trigger
-    # Sensitivity 10 (Strict) -> Requires 5% drop to trigger
-    
-    # Map slider (1-10) to a Percentage Threshold (0.70 to 0.95)
-    threshold_factor = 0.65 + (sensitivity * 0.03) 
-    
-    # 1. The Hunch Check (Neck gets shorter)
-    # If neck length shrinks below threshold% of baseline
-    neck_limit = st.session_state.baseline_neck * threshold_factor
-    is_hunching = curr_neck < neck_limit
-    
-    # 2. The Sink Check (Eyes drop down screen)
-    # If eyes drop more than X pixels (mapped to sensitivity)
-    # High sensitivity = Tolerates less drop (e.g. 20 pixels)
-    # Low sensitivity = Tolerates huge drop (e.g. 100 pixels)
-    drop_tolerance = 120 - (sensitivity * 10) 
-    is_sinking = curr_eye_level > (st.session_state.baseline_eye_level + drop_tolerance)
-    
-    is_bad = is_hunching or is_sinking
-    
-    # Pack debug info
-    debug = {
-        'curr_neck': int(curr_neck),
-        'limit_neck': int(neck_limit),
-        'curr_eye': int(curr_eye_level),
-        'limit_eye': int(st.session_state.baseline_eye_level + drop_tolerance),
-        'hunching': is_hunching,
-        'sinking': is_sinking
-    }
-    
-    draw_coords = (
-        int((left_ear.x+right_ear.x)/2 * w), int(avg_ear_y),
-        int((left_shoulder.x+right_shoulder.x)/2 * w), int(avg_shoulder_y)
+    return sh_y - ear_y, eye_y
+
+
+def check_posture(landmarks, shape, sensitivity):
+    h, w = shape[:2]
+    le, re = landmarks[7], landmarks[8]
+    ls, rs = landmarks[11], landmarks[12]
+    ley, rey = landmarks[2], landmarks[5]
+
+    ear_y = (le.y + re.y) / 2 * h
+    sh_y = (ls.y + rs.y) / 2 * h
+    eye_y = (ley.y + rey.y) / 2 * h
+
+    curr_neck = sh_y - ear_y
+    curr_eye = eye_y
+
+    factor = 0.65 + sensitivity * 0.03
+    neck_limit = st.session_state.baseline_neck * factor
+    is_hunch = curr_neck < neck_limit
+
+    drop = 120 - sensitivity * 10
+    is_sink = curr_eye > st.session_state.baseline_eye_level + drop
+
+    is_bad = is_hunch or is_sink
+
+    coords = (
+        int((le.x + re.x) / 2 * w), int(ear_y),
+        int((ls.x + rs.x) / 2 * w), int(sh_y)
     )
-    
-    return is_bad, draw_coords, debug
+
+    debug = {
+        "curr_neck": int(curr_neck),
+        "limit_neck": int(neck_limit),
+        "curr_eye": int(curr_eye),
+        "limit_eye": int(st.session_state.baseline_eye_level + drop),
+        "hunching": is_hunch,
+        "sinking": is_sink,
+    }
+
+    return is_bad, coords, debug
+
 
 def draw_hud(frame, is_bad, coords, debug):
     h, w = frame.shape[:2]
-    ear_x, ear_y, shldr_x, shldr_y = coords
-    
+    ex, ey, sx, sy = coords
     color = (0, 0, 255) if is_bad else (0, 255, 0)
-    
-    # Draw Skeleton Line
-    cv2.line(frame, (ear_x, ear_y), (shldr_x, shldr_y), color, 4)
-    cv2.circle(frame, (ear_x, ear_y), 6, (255, 255, 0), -1)
-    cv2.circle(frame, (shldr_x, shldr_y), 6, (255, 255, 0), -1)
-    
-    # Draw Status Box
-    cv2.rectangle(frame, (0, 0), (w, h), color, 10)
-    
-    # Draw Data Box (Top Left)
-    cv2.rectangle(frame, (0, 0), (300, 110), (0, 0, 0), -1)
-    cv2.putText(frame, f"Neck: {debug['curr_neck']} (Min: {debug['limit_neck']})", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-    cv2.putText(frame, f"Eyes: {debug['curr_eye']} (Max: {debug['limit_eye']})", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-    
+
+    cv2.line(frame, (ex, ey), (sx, sy), color, 4)
+    cv2.circle(frame, (ex, ey), 6, (255, 255, 0), -1)
+    cv2.circle(frame, (sx, sy), 6, (255, 255, 0), -1)
+
+    cv2.rectangle(frame, (10, 10), (340, 110), (0, 0, 0), -1)
+    cv2.rectangle(frame, (10, 10), (340, 110), (255, 255, 255), 2)
+
+    cv2.putText(frame, f"Neck: {debug['curr_neck']} (Min {debug['limit_neck']})",
+                (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+    cv2.putText(frame, f"Eyes: {debug['curr_eye']} (Max {debug['limit_eye']})",
+                (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+
     status = "GOOD"
-    if debug['hunching']: status = "HUNCHING!"
-    if debug['sinking']: status = "SINKING!"
-    
-    cv2.putText(frame, f"Status: {status}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-    
+    if debug["hunching"]: status = "HUNCHING!"
+    if debug["sinking"]: status = "SINKING!"
+
+    cv2.putText(frame, status, (20, 90),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
     if is_bad:
-        cv2.putText(frame, "FIX POSTURE!", (w//2 - 150, h//2), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
-        
+        cv2.rectangle(frame, (0,0), (w,h), (0,0,255), 10)
+        cv2.putText(frame, "FIX POSTURE!", (w//2-120, h//2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0,0,255), 3)
+
     return frame
 
+# =========================
+# ALARM THREAD
+# =========================
 def alarm_loop():
     while alarm_event.is_set():
-        try: winsound.Beep(1000, 200)
-        except: pass
-        time.sleep(0.5)
+        try:
+            if platform.system() == "Windows" and winsound:
+                winsound.Beep(1000, 150)
+            else:
+                print("\a", end="", flush=True)
+        except Exception:
+            pass
+        time.sleep(0.3)
 
-def main():
-    st.set_page_config(page_title="Posture Police", layout="wide")
-    initialize_session_state()
-    
-    with st.sidebar:
-        st.title("🎚️ Controls")
-        
-        # --- UPDATED: Slider now goes up to 60 seconds, Default is 30 ---
-        alarm_delay = st.slider("Alarm Delay (Seconds)", 1, 60, 30, help="Beeps only after this many seconds of continuous slouching")
-        
-        sensitivity = st.slider("Sensitivity", 1, 10, 8, help="Higher = Stricter")
-        
-        st.divider()
-        
-        camera_on = st.checkbox("Start Camera", value=st.session_state.camera_on)
-        st.session_state.camera_on = camera_on
-        
-        calibrate_btn = st.button("Calibrate Now", type="primary", disabled=not camera_on)
-        if st.session_state.calibrated: st.success("Calibrated!")
-        
-    st.title("Posture Police 📸🕵️‍♂️")
-    video_placeholder = st.empty()
-    
-    if camera_on:
-        cap = cv2.VideoCapture(0)
-        with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
-            while camera_on:
+# =========================
+# UI
+# =========================
+with st.sidebar:
+    st.title("🎚 Controls")
+    alarm_delay = st.slider("Alarm Delay (sec)", 1, 60, 30)
+    sensitivity = st.slider("Sensitivity", 1, 10, 8)
+
+    st.checkbox("Start Camera", key="camera_on")
+
+    if st.button("⏹ Stop Camera"):
+        st.session_state.stop_requested = True
+        st.rerun()
+
+    if st.button("🎯 Calibrate", disabled=not st.session_state.camera_on):
+        st.session_state.calibrate_request = True
+
+    if st.session_state.calibrated:
+        st.success("Calibrated ✅")
+
+st.title("👮 Posture Police")
+video_placeholder = st.empty()
+
+# =========================
+# MAIN LOOP
+# =========================
+if st.session_state.camera_on:
+    cap = get_camera()
+    pose = load_pose()
+
+    if not cap.isOpened():
+        st.error("❌ Camera not accessible.")
+    else:
+        try:
+            while st.session_state.camera_on:
                 ret, frame = cap.read()
-                if not ret: break
-                
+                if not ret:
+                    break
+
                 frame = cv2.flip(frame, 1)
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = pose.process(rgb_frame)
-                
-                if results.pose_landmarks:
-                    landmarks = results.pose_landmarks.landmark
-                    
-                    if calibrate_btn:
-                        n, e = calibrate(landmarks, frame.shape)
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                res = pose.process(rgb)
+
+                if res.pose_landmarks and len(res.pose_landmarks.landmark) > 12:
+                    lm = res.pose_landmarks.landmark
+
+                    if st.session_state.calibrate_request:
+                        n, e = calibrate(lm, frame.shape)
                         st.session_state.baseline_neck = n
                         st.session_state.baseline_eye_level = e
                         st.session_state.calibrated = True
+                        st.session_state.bad_posture_start = None
+                        alarm_event.clear()
+                        st.session_state.calibrate_request = False
                         st.rerun()
-                        
+
                     if st.session_state.calibrated:
-                        is_bad, coords, debug = check_posture(landmarks, frame.shape, sensitivity)
+                        is_bad, coords, debug = check_posture(lm, frame.shape, sensitivity)
                         frame = draw_hud(frame, is_bad, coords, debug)
-                        
+
                         if is_bad:
-                            if not st.session_state.bad_posture_start:
+                            if st.session_state.bad_posture_start is None:
                                 st.session_state.bad_posture_start = time.time()
-                            # --- LOGIC: Checks if current time > start time + 30 seconds ---
-                            elif time.time() - st.session_state.bad_posture_start > alarm_delay and not alarm_event.is_set():
-                                alarm_event.set()
-                                threading.Thread(target=alarm_loop, daemon=True).start()
+                            elif time.time() - st.session_state.bad_posture_start > alarm_delay:
+                                if not alarm_event.is_set():
+                                    alarm_event.set()
+                                    threading.Thread(target=alarm_loop, daemon=True).start()
                         else:
-                            # If you sit straight for even 1 frame, the timer resets!
                             st.session_state.bad_posture_start = None
                             alarm_event.clear()
                     else:
-                        cv2.putText(frame, "Sit Straight & Calibrate", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                        
-                video_placeholder.image(frame, channels="BGR")
-                if not st.session_state.camera_on: break
-        cap.release()
-        alarm_event.clear()
+                        cv2.putText(frame, "Sit straight & Calibrate",
+                                    (30, 60), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.8, (0,255,0), 2)
 
-if __name__ == "__main__":
-    main()
+                video_placeholder.image(frame, channels="BGR")
+                time.sleep(0.02)
+        finally:
+            release_camera()
+            alarm_event.clear()
+else:
+    release_camera()
+    alarm_event.clear()
+    video_placeholder.info("📹 Click 'Start Camera' to begin")
