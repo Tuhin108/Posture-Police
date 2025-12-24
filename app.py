@@ -1,3 +1,9 @@
+# =========================
+# FORCE MEDIAPIPE CPU (fix EGL crash on Streamlit Cloud)
+# =========================
+import os
+os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
+
 import streamlit as st
 import cv2
 import mediapipe as mp
@@ -44,6 +50,9 @@ mp_pose = mp.solutions.pose
 @st.cache_resource
 def load_pose():
     return mp_pose.Pose(
+        static_image_mode=False,
+        model_complexity=1,
+        enable_segmentation=False,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5
     )
@@ -123,8 +132,10 @@ def draw_hud(frame, is_bad, coords, debug):
                 (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
 
     status = "GOOD"
-    if debug["hunching"]: status = "HUNCHING!"
-    if debug["sinking"]: status = "SINKING!"
+    if debug["hunching"]:
+        status = "HUNCHING!"
+    if debug["sinking"]:
+        status = "SINKING!"
 
     cv2.putText(frame, status, (20, 90),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
