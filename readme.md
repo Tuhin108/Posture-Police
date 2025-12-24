@@ -103,4 +103,4 @@ Contributions are welcome! If you'd like to add cross-platform audio support or 
 4.  Push to the Branch (`git push origin feature/NewFeature`).
 5.  Open a Pull Request.
 
-`Made with ❤️ by Tuhin Kumar Singha Roy
+`Made with ❤️ by Tuhin Kumar Singha Roy`
